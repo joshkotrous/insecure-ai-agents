@@ -153,33 +153,43 @@ async def run_agents(prompt):
         print("----")
 
 
-def validate_prompt(prompt):
-    con = sqlite3.connect("als_patients.db")
-    cursor = con.cursor()
-    result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
-    names_list_of_tuples = result.fetchall()
-    cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
+   con = sqlite3.connect("als_patients.db")
+   cursor = con.cursor()
+   result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
+   names_list_of_tuples = result.fetchall()
+   cursor.close()
+    normalized_names = set()
+   for name in names_list_of_tuples:
+       full_name = name[0]
+       full_name = full_name.split(" ")
+       first = full_name[0]
+       last = full_name[1]
+        # Add original and normalized versions of names
+        normalized_names.add(first.lower())
+        normalized_names.add(last.lower())
+        # Remove common characters that could be used for obfuscation
+        normalized_first = ''.join(c for c in first.lower() if c.isalnum())
+        normalized_last = ''.join(c for c in last.lower() if c.isalnum())
+        normalized_names.add(normalized_first)
+        normalized_names.add(normalized_last)
+
+    # Normalize and check prompt
+    normalized_prompt = prompt.lower()
+    # Remove special characters and spaces
+    cleaned_prompt = ''.join(c for c in normalized_prompt if c.isalnum() or c.isspace())
+    prompt_words = cleaned_prompt.split()
+
+    # Check for both exact matches and substring matches
+    for word in prompt_words:
+        word = ''.join(c for c in word if c.isalnum())
+        if word in normalized_names or any(name in word for name in normalized_names):
+            return False
+        if any(word in name for name in normalized_names):
+            return False
+
+    if not prompt_words:
         return False
-    else:
-        return True
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--prompt', required=False)  # positional argument
-    args = parser.parse_args()
-
+    return True
     if not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
