@@ -86,28 +86,49 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
-def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
-    system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
-    You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
-    A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
-    Please provide a list of recommended patients for each trial.
-    Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
-    You can order the results by a relevant column to return the most interesting examples in the database.
-    Never query for all the columns from a specific table, only ask for the relevant columns given the question.
-    You have access to tools for interacting with the database.
-    Only use the below tools. Only use the information returned by the below tools to construct your final answer.
-    You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
-
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
-
-    To start you should ALWAYS look at the tables in the database to see what you can query.
+   db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+   toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    base_tools = toolkit.get_tools()
+    
+    # Create wrapped tools with query validation
+    tools = []
+    for tool in base_tools:
+        if hasattr(tool, 'run') and 'query' in tool.name.lower():
+            original_run = tool.run
+            def safe_run(query, *args, **kwargs):
+                # Validate query doesn't contain DML statements
+                query = query.lower().strip()
+                forbidden_keywords = ['insert', 'update', 'delete', 'drop', 'alter', 'create']
+                if any(keyword in query for keyword in forbidden_keywords):
+                    raise ValueError(f"DML statements are not allowed. Query contained forbidden operations.")
+                
+                # Validate query starts with SELECT
+                if not query.startswith('select'):
+                    raise ValueError("Only SELECT queries are allowed")
+                
+                # Execute validated query
+                return original_run(query, *args, **kwargs)
+            
+            tool.run = safe_run
+        tools.append(tool)
+   prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
+   assert len(prompt_template.messages) == 1
+   system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
+   You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
+   A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
+   Please provide a list of recommended patients for each trial.
+   Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
+   You can order the results by a relevant column to return the most interesting examples in the database.
+   Never query for all the columns from a specific table, only ask for the relevant columns given the question.
+   You have access to tools for interacting with the database.
+   Only use the below tools. Only use the information returned by the below tools to construct your final answer.
+   You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
+   DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+   To start you should ALWAYS look at the tables in the database to see what you can query.
+   Do NOT skip this step.
+   Then you should query the schema of the most relevant tables."""
+   sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
+   return sql_agent_executor
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
