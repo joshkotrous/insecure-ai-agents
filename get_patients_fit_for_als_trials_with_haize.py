@@ -28,11 +28,42 @@ LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
 
 def _set_env(key: str):
     if key not in os.environ:
-        os.environ[key] = getpass.getpass(f"{key}:")
+# set llm and create team members for the lead agent to supervise
+llm = ChatOpenAI(model="gpt-4o-mini")
 
+def validate_llm_output(output: str, context: str) -> bool:
+    """Validates LLM output for medical recommendations"""
+    try:
+        # Validate output contains required medical context
+        if not any(term in output.lower() for term in ['trial', 'study', 'patient', 'recommend']):
+            return False
+            
+        # Validate output length and structure
+        if len(output) < 10 or len(output) > 2000:
+            return False
+            
+        # Validate output matches context
+        if context == 'clinical_trials' and 'length of study' not in output.lower():
+            return False
+            
+        if context == 'patient_recommendations':
+            if not all(term in output.lower() for term in ['patient', 'trial', 'recommend']):
+                return False
+                
+        return True
+        
+    except Exception:
+        return False
 
-_set_env("OPENAI_API_KEY")
-_set_env("HAIZE_LABS_API_KEY")
+def sanitize_medical_output(output: str) -> str:
+    """Sanitizes LLM output for medical recommendations"""
+    # Remove any potentially harmful content
+    sanitized = output.replace("URGENT", "").replace("EMERGENCY", "")
+    return sanitized.strip()
+
+members = ["clinical_researcher", "database_admin"]
+# Our team supervisor is an LLM node. It picks the next agent to process
+# and decides when the work is completed
 haize_client = HaizeClient()
 
 # set llm and create team members for the lead agent to supervise
@@ -52,14 +83,19 @@ class Router(TypedDict):
 def call_haize_judge(judge_ids, messages):
     response = haize_client.judges.call(
         judge_ids=judge_ids,
-        messages=messages,
-    )
-    return response
-
-
-def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
-    system_prompt = (
-        "You are a supervisor tasked with managing a conversation between the"
+                   {"role": "system", "content": system_prompt},
+               ] + state["messages"]
+    response = llm.with_structured_output(Router).invoke(messages)
+    
+    # Validate and sanitize LLM output
+    if not validate_llm_output(str(response), "supervisor"):
+        goto = END
+    else:
+        goto = response["next"]
+        
+    if goto == "FINISH":
+        goto = END
+    return Command(goto=goto)
         f" following workers: {members}. Given the following user request,"
         " respond with the worker to act next. Each worker will perform a"
         " task and respond with their results and status. When finished,"
