@@ -87,10 +87,89 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+# --- PATCH: Restrict DB access, block DML, redact PII fields ---
+def is_readonly_safe_sql(query: str) -> bool:
+    """Return True if only SELECT/PRAGMA (read-only) statements are present."""
+    lowered = query.lower()
+    # Block all DML and dangerous DDL
+    for bad in ["insert", "update", "delete", "drop", "alter", "truncate", "replace", "create", "attach", "detach"]:
+        # Only block if keyword appears as a standalone SQL word
+        if f"{bad} " in lowered or lowered.startswith(bad):
+            return False
+    # Allow SELECT/PRAGMA only
+    if not (lowered.strip().startswith("select") or lowered.strip().startswith("pragma")):
+        return False
+    return True
+
+def redact_pii(result, columns):
+    # List of known PII columns - adjust as needed for your DB schema
+    PII_FIELDS = {"name", "address", "phone", "email", "dob", "birthdate", "ssn"}
+    redacted_result = []
+    for row in result:
+        redacted_row = []
+        for idx, value in enumerate(row):
+            col = columns[idx].lower()
+            if col in PII_FIELDS:
+                redacted_row.append("[REDACTED]")
+            else:
+                redacted_row.append(value)
+        redacted_result.append(tuple(redacted_row))
+    return redacted_result
+
+class ReadOnlySQLDatabase(SQLDatabase):
+    def __init__(self, url: str):
+        # Use SQLite URI with mode=ro for read-only at connection
+        super().__init__(url)
+
+    def _driver_connect(self, url: str, *args, **kwargs):
+        # Force SQLite read-only connection
+        # Handles both sqlite:///... and sqlite:///<path>?mode=ro
+        if url.startswith("sqlite:///"):
+            path = url[len("sqlite:///"):]
+            # If "?mode=ro" not set, add it
+            if "?mode=ro" not in path:
+                if "?" in path:
+                    path += "&mode=ro"
+                else:
+                    path += "?mode=ro"
+            ro_url = "file:" + path
+            con = sqlite3.connect(ro_url, uri=True, check_same_thread=False)
+            return con
+        else:
+            # fallback
+            return super()._driver_connect(url, *args, **kwargs)
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Instantiate custom ReadOnly DB object using SQLite URI with mode=ro
+    db = ReadOnlySQLDatabase("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
+
+    # PATCH: Wrap all SQL execution tools to enforce whitelisting of only SELECT/PRAGMA
+    for tool in tools:
+        if hasattr(tool, "run"):
+            orig_run = tool.run
+            def safe_run(query, *args, orig_run=orig_run, **kwargs):
+                if not is_readonly_safe_sql(query):
+                    raise Exception("DML/DDL statements (INSERT, UPDATE, DELETE, CREATE, DROP, etc.) are not allowed.")
+                # Run the original, then redact results if column metadata is available
+                res = orig_run(query, *args, **kwargs)
+                # Try to redact result if possible
+                # If res is a list of tuples and .columns attribute exists:
+                if hasattr(tool, "db") and hasattr(tool.db, "run") and hasattr(tool.db, "_get_cursor"):
+                    try:
+                        # Extract columns from the query result metadata
+                        with tool.db._get_cursor() as cursor:
+                            cursor.execute("PRAGMA table_info(patients)")
+                            columns = [row[1] for row in cursor.fetchall()]
+                        # If result is a list of tuples, redact PII
+                        if isinstance(res, list) and all(isinstance(t, tuple) for t in res):
+                            res = redact_pii(res, columns)
+                    except Exception:
+                        pass
+                return res
+            tool.run = safe_run
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
     assert len(prompt_template.messages) == 1
@@ -153,17 +232,19 @@ async def run_agents(prompt):
         print("----")
 
 
-   con = sqlite3.connect("als_patients.db")
-   cursor = con.cursor()
-   result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
-   names_list_of_tuples = result.fetchall()
-   cursor.close()
+    # (The previous validate_prompt code block unrelated to DB usage is unchanged.)
+
+    con = sqlite3.connect("als_patients.db")
+    cursor = con.cursor()
+    result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
+    names_list_of_tuples = result.fetchall()
+    cursor.close()
     normalized_names = set()
-   for name in names_list_of_tuples:
-       full_name = name[0]
-       full_name = full_name.split(" ")
-       first = full_name[0]
-       last = full_name[1]
+    for name in names_list_of_tuples:
+        full_name = name[0]
+        full_name = full_name.split(" ")
+        first = full_name[0]
+        last = full_name[1]
         # Add original and normalized versions of names
         normalized_names.add(first.lower())
         normalized_names.add(last.lower())
@@ -201,4 +282,3 @@ async def run_agents(prompt):
 
 if __name__ == '__main__':
     main()
-
