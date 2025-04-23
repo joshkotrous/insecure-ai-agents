@@ -1,7 +1,7 @@
 import getpass
 import os
 import asyncio
-from typing import Literal
+from typing import Literal, List
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -14,6 +14,8 @@ from langgraph.types import Command
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
+import re
+import inspect
 
 # allow tracing via LangSmith for observability and debugging
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -85,10 +87,114 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
         goto="supervisor",
     )
 
+############ VULN PATCH START #############
+# --- Safe SQL enforcement layer for DB admin agent ---
+
+import functools
+
+def _is_safe_select_query(query: str, allowed_tables: List[str], allowed_columns: dict) -> bool:
+    """
+    Enforce that query is a single SELECT statement, not containing wildcards or DML/DDL,
+    and only allowed columns from allowed_tables.
+    """
+    # Block newlines/tabs and uppercase/lowercase through normalization
+    normalized = query.strip().replace("\n", " ").replace("\r", " ")
+    # Only allow SELECTs, block other statements
+    if not re.match(r"(?i)^select\s", normalized):
+        return False
+    # Disallow ; (multiple statements)
+    if ";" in normalized:
+        return False
+    # Disallow suspicious keywords (DML/DDL/PRAGMA/etc.)
+    blacklist = [
+        r"(?i)\b(insert|update|delete|drop|create|alter|pragma|attach|detach|vacuum|replace)\b"
+    ]
+    for pattern in blacklist:
+        if re.search(pattern, normalized):
+            return False
+    # Disallow wildcard "*"
+    if re.search(r"select\s*\*", normalized, re.IGNORECASE):
+        return False
+    # Parse out table and columns (simple regex-based check, not SQL parser)
+    # Assume query of form: SELECT col1, col2 FROM tablename ... (no joins, no subqueries)
+    select_match = re.match(
+        r"(?i)select\s+([a-zA-Z0-9_,\s]+)\s+from\s+([a-zA-Z0-9_]+)", normalized
+    )
+    if not select_match:
+        return False
+    cols_str, table = select_match.groups()
+    table = table.strip().lower()
+    if table not in allowed_tables:
+        return False
+    # Only allowed columns for this table
+    allowed = allowed_columns.get(table, [])
+    cols = [c.strip().lower() for c in cols_str.split(",")]
+    if not all(c in allowed for c in cols):
+        return False
+    # Rudimentary check against UNION, subselects, etc.
+    if " union " in normalized.lower() or " select " in normalized.lower()[8:]:
+        return False
+    return True
+
+class SafeSQLDatabaseToolkit(SQLDatabaseToolkit):
+    """
+    Wraps SQLDatabaseToolkit tools so only allow SELECT queries on whitelisted columns/tables.
+    """
+
+    SAFE_TABLES = ["patients"]
+    # Should be set according to your DB schema!
+    SAFE_COLUMNS = {
+        "patients": [
+            "patient_id", "diagnosis_date", "expected_survival_months", "age", "gender"  # ADJUST to your schema!
+        ]
+    }
+
+    def get_tools(self):
+        # get the real tools, wrap SQL-execution ones with filter
+        tools = super().get_tools()
+        for idx, tool in enumerate(tools):
+            original_run = tool.run
+            # Wrap run method
+            @functools.wraps(original_run)
+            def safe_run(*args, __orig_run=original_run, **kwargs):
+                # Figure out the actual SQL, regardless of tool signature (some tools take 'query', some 'input')
+                sql = None
+                if "query" in kwargs:
+                    sql = kwargs["query"]
+                elif "input" in kwargs:
+                    sql = kwargs["input"]
+                elif len(args) > 0:
+                    sql = args[0]
+                if sql and isinstance(sql, str):
+                    if not _is_safe_select_query(sql, self.SAFE_TABLES, self.SAFE_COLUMNS):
+                        return "[SECURITY ERROR] Query rejected: Only SELECT queries on allowed columns/tables are permitted."
+                # Call the original if safe OR if not actually executing SQL.
+                return __orig_run(*args, **kwargs)
+            # Patch the tool to use safe_run (for this instance only)
+            tool.run = safe_run
+            # Also patch ainvoke/invoke if present
+            if hasattr(tool, "ainvoke"):
+                orig_ainvoke = tool.ainvoke
+                async def safe_ainvoke(*args, __orig_run=original_run, **kwargs):
+                    sql = None
+                    if "query" in kwargs:
+                        sql = kwargs["query"]
+                    elif "input" in kwargs:
+                        sql = kwargs["input"]
+                    elif len(args) > 0:
+                        sql = args[0]
+                    if sql and isinstance(sql, str):
+                        if not _is_safe_select_query(sql, self.SAFE_TABLES, self.SAFE_COLUMNS):
+                            return "[SECURITY ERROR] Query rejected: Only SELECT queries on allowed columns/tables are permitted."
+                    return await orig_ainvoke(*args, **kwargs)
+                tool.ainvoke = safe_ainvoke
+        return tools
+############ VULN PATCH END #############
 
 def create_database_admin_agent():
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    # PATCH: use SafeSQLDatabaseToolkit instead of vanilla toolkit
+    toolkit = SafeSQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
@@ -159,4 +265,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
